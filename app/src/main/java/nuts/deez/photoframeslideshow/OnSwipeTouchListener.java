@@ -29,9 +29,11 @@ public class OnSwipeTouchListener implements View.OnTouchListener {
     public void onSwipeDown() {
     }
 
-    public void onScreenTap() {
+    public void onScreenTap(float x) {
 
     }
+    public void onLongPress() {}
+
     public void onDoubleScreenTap() {
 
     }
@@ -50,7 +52,12 @@ public class OnSwipeTouchListener implements View.OnTouchListener {
         @Override
         public boolean onDown(MotionEvent e) {
             //Log.i("OnSwipeTouchListener","onDown");
-            return false;
+            return true;
+        }
+
+        @Override
+        public void onLongPress(MotionEvent e) {
+            OnSwipeTouchListener.this.onLongPress();
         }
 
         @Override
@@ -63,13 +70,14 @@ public class OnSwipeTouchListener implements View.OnTouchListener {
         @Override
         public boolean onSingleTapConfirmed(MotionEvent e) {
             //Log.i("OnSwipeTouchListener","Single Tap Confirmed");
-            onScreenTap();
+            onScreenTap(e.getX());
             return true;
         }
 
         @Override
         public boolean onFling(MotionEvent e1, MotionEvent e2, float velocityX, float velocityY) {
             //Log.i("OnSwipeTouchListener","Detecting flings");
+            if (e1 == null || e2 == null) return false;
             float distanceX = e2.getX() - e1.getX();
             float distanceY = e2.getY() - e1.getY();
             if (Math.abs(distanceX) > Math.abs(distanceY) && Math.abs(distanceX) > SWIPE_DISTANCE_THRESHOLD && Math.abs(velocityX) > SWIPE_VELOCITY_THRESHOLD) {

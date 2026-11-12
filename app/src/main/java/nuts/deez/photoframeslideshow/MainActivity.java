@@ -3,13 +3,8 @@ package nuts.deez.photoframeslideshow;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
-import android.graphics.Matrix;
-import android.icu.text.SimpleDateFormat;
-import androidx.exifinterface.media.ExifInterface;
-
 import android.net.Uri;
 import android.os.AsyncTask;
 import android.os.Build;
@@ -17,811 +12,431 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.PowerManager;
-import android.os.PowerManager.WakeLock;
-import androidx.core.app.ActivityCompat;
-import androidx.appcompat.app.AppCompatActivity;
-
 import android.provider.Settings;
 import android.util.Log;
 import android.view.View;
-import android.view.Window;
 import android.view.WindowManager;
-import android.widget.ImageView;
-import android.widget.Toast;
-
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.exifinterface.media.ExifInterface;
 import org.json.JSONArray;
-import org.json.JSONException;
 import org.json.JSONObject;
-
 import java.io.BufferedReader;
 import java.io.DataOutputStream;
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
 import java.io.FileReader;
 import java.io.FileWriter;
-import java.io.IOException;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collections;
 import java.util.Date;
+import java.util.HashSet;
 import java.util.List;
-import java.util.TimeZone;
+import java.util.Locale;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 public class MainActivity extends AppCompatActivity {
-
-    ImageView image;
-    Bitmap lastBitmap = null;
-    WakeLock keepAlive = null;
-
     private static final String TAG = "PhotoFrameSlideshow";
-
-    // Storage Permissions
     private static final int REQUEST_EXTERNAL_STORAGE = 1;
-    private static final String[] PERMISSIONS_STORAGE = {
-            Manifest.permission.READ_EXTERNAL_STORAGE,
-            Manifest.permission.WRITE_EXTERNAL_STORAGE
-    };
-
-    String imageFolder = Environment.getExternalStorageDirectory().toString() + "/Pictures/";
-    String configFilename = "config.json";
-
-    int imageUpdateTime = 15; //Seconds
-    int ntpUpdateTime   = 900; //Seconds
-    boolean shuffleImages = true;
-    boolean showFileNames = true;
-    int activeHourStart = 7;
-    int activeHourEnd = 23;
-    boolean active = true;
-    String ntpServer = "";
-    boolean forceClockSync = false;
-
-    int frameWidth = 1920;
-    int frameHeight = 1080;
-
+    PhotoFrameView image;
+    FrameVideoView video;
+    PhotoLoader photoLoader;
+    FrameControls controls;
+    private final StatusBarGuard statusBarGuard = new StatusBarGuard();
+    PowerManager.WakeLock keepAlive;
     Handler updateImageHandler;
-    Handler updateNtpHandler;
-    boolean hideUi = true;
-    boolean pause = false;
-    int imageIndex = -1;
-
-    List<String> picturesRemaining = new ArrayList<>();
-    List<String> allPictures = new ArrayList<>();
-
-    List<String> allowedFileExtensions = new ArrayList<>();
-    List<String> subdirectories = new ArrayList<>();
-
-    private final Runnable updateImageRunnable = new Runnable() {
-        @Override
-        public void run() {
-            updateImage();
-            updateImageHandler.postDelayed(this, imageUpdateTime * 1000L);
+    private final Handler ntpHandler = new Handler();
+    private ClockTask ntpTask;
+    private final ExecutorService mediaScanner = Executors.newSingleThreadExecutor();
+    private Future<?> scanJob;
+    private boolean scanning;
+    private int scanSerial;
+    private long lastScanAt, configModified = -1, cacheRevision;
+    private String sourceSettings = "", resumeSource;
+    private final Set<String> unreadableMedia = new HashSet<>();
+    List<String> allPictures = new ArrayList<>(), picturesRemaining = new ArrayList<>();
+    ArrayList<Integer> randomPageStarts = new ArrayList<>(), randomPageCounts = new ArrayList<>();
+    int imageIndex = -1, photosPerPage = 1, configuredPhotoCount = 1, pagePlanMode = -1;
+    int frameWidth, frameHeight, photoRequest, transitionDirection = 1, transitionDuration = 600;
+    int imageUpdateTime = 60, ntpUpdateTime = 3600, activeHourStart = 7, activeHourEnd = 23;
+    boolean pause, active = true, randomPhotoCount, cropPhotos, blurPhotos = true, shuffleImages = true;
+    boolean showingVideo, forceClockSync;
+    int videoResumePosition;
+    String transitionEffect = "fade", ntpServer = "pool.ntp.org";
+    String imageFolder = Environment.getExternalStorageDirectory() + "/Pictures/";
+    final Runnable updateImageRunnable = () -> {
+        if (!pause && active && (controls == null || !controls.blocked())) updateImage();
+        delayImageUpdate();
+    };
+    private final Runnable ntpRunnable = new Runnable() {
+        @Override public void run() {
+            if (controls == null || controls.blocked()) return;
+            if (forceClockSync && !ntpServer.isEmpty() && (ntpTask == null || ntpTask.getStatus() == AsyncTask.Status.FINISHED)) {
+                ntpTask = new ClockTask(); ntpTask.execute();
+            }
+            ntpHandler.postDelayed(this, ntpUpdateTime * 1000L);
         }
     };
-
-    private final Runnable updateNtpRunnable = new Runnable() {
-        @Override
-        public void run() {
-            new GetNTPTimeBackground().execute();
-            updateNtpHandler.postDelayed(this, ntpUpdateTime * 1000L);
-        }
-    };
-
-
-    @SuppressLint({"ClickableViewAccessibility", "WakelockTimeout", "BatteryLife", "ObsoleteSdkInt"})
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
+    private static final class PlaybackState {
+        List<String> all, remaining;
+        ArrayList<Integer> starts, counts;
+        int index, mode;
+    }
+    private String activeLanguage;
+    @Override protected void attachBaseContext(android.content.Context base) {
+        activeLanguage = AppLanguage.code(base);
+        super.attachBaseContext(AppLanguage.wrap(base));
+    }
+    @SuppressLint({"ClickableViewAccessibility", "WakelockTimeout", "BatteryLife"})
+    @Override protected void onCreate(Bundle saved) {
+        super.onCreate(saved);
         setContentView(R.layout.activity_main);
-
-        //Wakelock used to keep time updates and everything going overnight
-        keepAlive = ((PowerManager) getSystemService(POWER_SERVICE)).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "KeepAlive WakeLock:");
-        keepAlive.acquire();
-
-        image = findViewById(R.id.imageView);
-        image.setOnTouchListener(new OnSwipeTouchListener(getApplicationContext()){
-            @Override
-            public void onSwipeLeft() {
-                //Toast.makeText(getApplicationContext(), "Swipe Left", Toast.LENGTH_SHORT).show();
-                //Go to next image (And reset timer)
-                goToNextImage();
-            }
-
-            @Override
-            public void onSwipeRight() {
-                //Toast.makeText(getApplicationContext(), "Swipe Right", Toast.LENGTH_SHORT).show();
-                //Go to previous image (and reset timer)
-                goToPreviousImage();
-            }
-
-            @Override
-            public void onSwipeUp() {
-                //Toast.makeText(getApplicationContext(), "Swipe Up", Toast.LENGTH_SHORT).show();
-                //Rotate image counter clockwise
-                rotatePicture(false);
-            }
-
-            @Override
-            public void onSwipeDown() {
-                //Toast.makeText(getApplicationContext(), "Swipe Down", Toast.LENGTH_SHORT).show();
-                //Rotate image clockwise
-                rotatePicture(true);
-            }
-
-            @Override
-            public void onScreenTap() {
-                //Toast.makeText(getApplicationContext(), "Tap", Toast.LENGTH_SHORT).show();
-                pauseUnpauseImages();
-            }
-
-            @Override
-            public void onDoubleScreenTap() {
-                //Toast.makeText(getApplicationContext(), "Double Tap", Toast.LENGTH_SHORT).show();
-                hideUi = !hideUi;
-                updateFlagsAndStuff();
-            }
-
-        });
-
-        updateFlagsAndStuff();
-
-        //Get storage permissions
-        int permission = ActivityCompat.checkSelfPermission(getApplicationContext(), Manifest.permission.WRITE_EXTERNAL_STORAGE);
-        if (permission != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(
-                    this,
-                    PERMISSIONS_STORAGE,
-                    REQUEST_EXTERNAL_STORAGE);
-        }
-
-        //Ask to disable battery optimizations
-        if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            Intent intent = new Intent();
-            String packageName = getPackageName();
-            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
-            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-                intent.setAction(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
-                intent.setData(Uri.parse("package:" + packageName));
-                startActivity(intent);
-            }
-        }
-
-
-        allowedFileExtensions.add(".png");
-        allowedFileExtensions.add(".jpg");
-        allowedFileExtensions.add(".jpeg");
-        allowedFileExtensions.add(".bmp");
-
+        image = findViewById(R.id.imageView); video = findViewById(R.id.videoView);
+        updateImageHandler = new Handler(); photoLoader = PhotoLoader.shared(this);
+        keepAlive = ((PowerManager) getSystemService(POWER_SERVICE)).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, TAG + ":frame");
         frameWidth = getResources().getDisplayMetrics().widthPixels;
         frameHeight = getResources().getDisplayMetrics().heightPixels;
-        Log.i(TAG, "Frame is " + frameWidth + " by " + frameHeight);
-
-        imageIndex = -1;
-
-        loadConfigFile();
-        if (savedInstanceState!=null){
-            //App is being reloaded
-
-            imageIndex = savedInstanceState.getInt("imageIndex");
-            if (imageIndex>=0){
-                imageIndex--;
-            }
-            picturesRemaining = savedInstanceState.getStringArrayList("picturesRemaining");
-            pause = savedInstanceState.getBoolean("pause");
-            active = savedInstanceState.getBoolean("pause");
-            if (pause){
-                updateImage(); //Since we won't get called by the periodic timer, manually call here to draw the image
-            }
-            showPauseIcon(pause);
+        Object retained = getLastCustomNonConfigurationInstance();
+        if (retained instanceof PlaybackState) {
+            PlaybackState state = (PlaybackState) retained;
+            allPictures = state.all; picturesRemaining = state.remaining;
+            randomPageStarts = state.starts; randomPageCounts = state.counts;
+            imageIndex = state.index; pagePlanMode = state.mode;
         }
-
-        updateImageHandler = new Handler();
-
-        if (!pause) {
-            updateImageHandler.post(updateImageRunnable);
+        if (saved != null) {
+            pause = saved.getBoolean("pause"); resumeSource = saved.getString("resumeSource");
+            videoResumePosition = saved.getInt("videoPosition");
         }
-
-
-        updateNtpHandler = new Handler();
-        updateNtpHandler.post(updateNtpRunnable);
-
-        turnScreenOn();
-
-
+        findViewById(R.id.gestureLayer).setOnTouchListener(new OnSwipeTouchListener(this) {
+            @Override public void onSwipeLeft() { goToNextImage(); }
+            @Override public void onSwipeRight() { goToPreviousImage(); }
+            @Override public void onSwipeUp() { rotatePicture(false); }
+            @Override public void onSwipeDown() { rotatePicture(true); }
+            @Override public void onScreenTap(float x) { if (x < image.getWidth() / 2f) goToPreviousImage(); else goToNextImage(); }
+            @Override public void onLongPress() { pauseUnpauseImages(); }
+            @Override public void onDoubleScreenTap() { controls.showSettings(); }
+        });
+        loadConfigFile(); controls = new FrameControls(this);
+        if (saved != null) controls.restoreNight(saved.getBoolean("ambientDark", false));
+        requestMediaPermissions(); updateFlagsAndStuff(); turnScreenOn();
+        if (Build.VERSION.SDK_INT >= 23) {
+            PowerManager manager = (PowerManager) getSystemService(POWER_SERVICE);
+            if (!manager.isIgnoringBatteryOptimizations(getPackageName())) {
+                Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + getPackageName()));
+                if (intent.resolveActivity(getPackageManager()) != null) startActivity(intent);
+            }
+        }
     }
-
-    @Override
-    protected void onDestroy() {
-        super.onDestroy();
-        Log.i(TAG, "Getting destroyed - probably a rotation?");
-        if (lastBitmap != null) {
-            lastBitmap.recycle();
-        }
-        lastBitmap = null;
+    @Override public Object onRetainCustomNonConfigurationInstance() {
+        PlaybackState state = new PlaybackState();
+        state.all = allPictures; state.remaining = picturesRemaining;
+        state.starts = randomPageStarts; state.counts = randomPageCounts;
+        state.index = imageIndex; state.mode = pagePlanMode; return state;
+    }
+    @Override protected void onSaveInstanceState(Bundle out) {
+        super.onSaveInstanceState(out); out.putBoolean("pause", pause);
+        out.putBoolean("ambientDark", controls != null && controls.ambientDark());
+        if (imageIndex >= 0 && imageIndex < picturesRemaining.size()) out.putString("resumeSource", picturesRemaining.get(imageIndex));
+        out.putInt("videoPosition", showingVideo ? video.position() : 0);
+        // Large libraries stay in the retained state, never in a Binder-sized Bundle.
+    }
+    @Override protected void onResume() { super.onResume(); if (!AppLanguage.code(this).equals(activeLanguage)) { recreate(); return; } if (controls != null) controls.start(); statusBarGuard.start(this); }
+    @Override protected void onPause() { statusBarGuard.stop(); if (controls != null) controls.stop(); super.onPause(); }
+    @Override public void onWindowFocusChanged(boolean focus) { super.onWindowFocusChanged(focus); if (focus) updateFlagsAndStuff(); }
+    @Override public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (photoLoader != null && level != TRIM_MEMORY_UI_HIDDEN && level >= TRIM_MEMORY_RUNNING_LOW) photoLoader.trim();
+    }
+    @Override protected void onDestroy() {
+        statusBarGuard.stop();
+        if (controls != null) controls.close();
+        photoRequest++; scanSerial++; mediaScanner.shutdownNow();
+        updateImageHandler.removeCallbacksAndMessages(null); ntpHandler.removeCallbacksAndMessages(null);
+        if (ntpTask != null) ntpTask.cancel(true);
+        video.stop(); image.clearPhoto(); image.setImageDrawable(null); photoLoader.suspend();
+        if (keepAlive.isHeld()) keepAlive.release(); super.onDestroy();
+    }
+    private String[] mediaPermissions() {
+        if (Build.VERSION.SDK_INT >= 33 && getApplicationInfo().targetSdkVersion >= 33)
+            return new String[]{"android.permission.READ_MEDIA_IMAGES", "android.permission.READ_MEDIA_VIDEO"};
+        if (Build.VERSION.SDK_INT <= 28) return new String[]{Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE};
+        return new String[]{Manifest.permission.READ_EXTERNAL_STORAGE};
+    }
+    private boolean hasMediaPermission() {
+        if (Build.VERSION.SDK_INT < 23) return true;
+        for (String permission : mediaPermissions())
+            if (!Manifest.permission.WRITE_EXTERNAL_STORAGE.equals(permission)
+                    && ActivityCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED) return true;
+        return false;
+    }
+    private void requestMediaPermissions() {
+        if (Build.VERSION.SDK_INT >= 23 && !hasMediaPermission()) ActivityCompat.requestPermissions(this, mediaPermissions(), REQUEST_EXTERNAL_STORAGE);
+    }
+    @Override public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(request, permissions, results);
+        if (request != REQUEST_EXTERNAL_STORAGE) return;
+        if (hasMediaPermission()) { loadConfigFile(); requestMediaScan(true); }
+        else if (controls != null) controls.setPhoto(MainActivity.this.getString(R.string.text_photo_video_access_is_missing_grant_permission_in_app_settings));
+    }
+    void applySettings() {
+        SharedPreferences prefs = FramePreferences.get(this);
+        imageUpdateTime = Math.max(3, prefs.getInt("imageTime", imageUpdateTime));
+        int mode = FramePreferences.photoCount(this);
+        randomPhotoCount = mode == 0; configuredPhotoCount = randomPhotoCount ? 1 : mode;
+        if (pagePlanMode != mode) { randomPageStarts.clear(); randomPageCounts.clear(); }
+        ensureRandomPages();
+        if (imageIndex >= 0 && !randomPageStarts.isEmpty()) imageIndex = randomPageStarts.get(randomPageIndex(imageIndex));
+        photosPerPage = countAt(imageIndex);
+        cropPhotos = prefs.getBoolean("crop", false); blurPhotos = prefs.getBoolean("blur", true);
+        transitionEffect = prefs.getString("effect", "fade"); transitionDuration = prefs.getInt("effectDuration", 600);
+        boolean shuffle = prefs.getBoolean("shuffle", shuffleImages);
+        if (shuffle != shuffleImages) { shuffleImages = shuffle; refillRemainingPictures(); imageIndex = picturesRemaining.isEmpty() ? -1 : 0; }
+        long revision = prefs.getLong("cacheRevision", 0);
+        if (revision != cacheRevision) { photoLoader.clear(); cacheRevision = revision; }
+        photoLoader.configure();
+        String sources = prefs.getString("mediaSource", "all") + ':' + prefs.getBoolean("includeVideos", true) + ':' + prefs.getLong("mediaRevision", 0);
+        if (!sources.equals(sourceSettings)) { sourceSettings = sources; unreadableMedia.clear(); requestMediaScan(true); }
+    }
+    void resumeFrame() {
+        if (!keepAlive.isHeld()) keepAlive.acquire();
+        loadConfigFile(); requestMediaScan(false);
+        if (!hasMediaPermission()) { showNoPicturesIcon(); controls.setPhoto(MainActivity.this.getString(R.string.text_grant_photo_video_access_to_open_your_library)); return; }
+        if (imageIndex >= 0 && imageIndex < picturesRemaining.size()) showPictureAsync(picturesRemaining.get(imageIndex));
+        else updateImage();
+        delayImageUpdate(); ntpHandler.removeCallbacks(ntpRunnable); ntpHandler.postDelayed(ntpRunnable, ntpUpdateTime * 1000L);
+    }
+    void suspendFrame() {
+        updateImageHandler.removeCallbacksAndMessages(null); ntpHandler.removeCallbacksAndMessages(null);
+        if (ntpTask != null) ntpTask.cancel(true);
+        photoRequest++; photoLoader.suspend(); image.finishTransition(); video.setPaused(true);
+        if (scanJob != null && scanning) { scanJob.cancel(true); scanSerial++; scanning = false; lastScanAt = 0; }
+        if (keepAlive.isHeld()) keepAlive.release();
+    }
+    void showPauseIcon(boolean ignored) { findViewById(R.id.pauseIcon).setVisibility(View.GONE); }
+    void pauseUnpauseImages() {
+        if (controls.blocked()) return;
+        pause = !pause; showPauseIcon(pause);
+        if (showingVideo) video.setPaused(pause || !active);
+        controls.refreshPlayback();
+    }
+    void delayImageUpdate() {
         updateImageHandler.removeCallbacks(updateImageRunnable);
-        updateNtpHandler.removeCallbacks(updateNtpRunnable);
-        keepAlive.release();
-
+        if (controls != null) controls.resetCountdown();
+        if (!pause && active && !showingVideo && (controls == null || !controls.blocked())) updateImageHandler.postDelayed(updateImageRunnable, imageUpdateTime * 1000L);
     }
-
-    @Override
-    protected void onSaveInstanceState(Bundle outState){
-        super.onSaveInstanceState(outState);
-        outState.putInt("imageIndex",imageIndex);
-        outState.putStringArrayList("picturesRemaining",(ArrayList<String>)picturesRemaining);
-        outState.putBoolean("pause",pause);
-        outState.putBoolean("active",active);
-    }
-
-    void showPauseIcon(boolean show){
-        ImageView pauseIcon = findViewById(R.id.pauseIcon);
-        if (show){
-            pauseIcon.setVisibility(View.VISIBLE);
-        } else {
-            pauseIcon.setVisibility(View.INVISIBLE);
-        }
-
-    }
-
-    void pauseUnpauseImages(){
-
-        pause = !pause;
-
-        showPauseIcon(pause);
-
-        if (pause){
-            Toast.makeText(getApplicationContext(), "Paused", Toast.LENGTH_SHORT).show();
-            updateImageHandler.removeCallbacks(updateImageRunnable);
-        } else {
-            Toast.makeText(getApplicationContext(), "Unpaused", Toast.LENGTH_SHORT).show();
-            updateImageHandler.postDelayed(updateImageRunnable, imageUpdateTime * 1000L);
-        }
-    }
-
-    void delayImageUpdate(){
-        updateImageHandler.removeCallbacks(updateImageRunnable);
-        updateImageHandler.postDelayed(updateImageRunnable, imageUpdateTime * 1000L);
-    }
-
-    void createDefaultConfig(FileWriter fw) {
-        JSONObject config = new JSONObject();
-        try {
-            config.put("imageTime", 60);
-            config.put("shuffle", true);
-            config.put("showFileNames", true);
-            config.put("activeHourStart", 7);
-            config.put("activeHourEnd", 23);
-            config.put("ntpServer","pool.ntp.org");
-            config.put("forceClockSync",false);
-            config.put("ntpSyncInterval",3600);
-
-            JSONArray fileTypes = new JSONArray();
-            fileTypes.put(".png");
-            fileTypes.put(".jpg");
-            fileTypes.put(".jpeg");
-            fileTypes.put(".bmp");
-
-            config.put("fileTypes", fileTypes);
-
-            JSONArray subdirs = new JSONArray();
-            JSONObject subdirInfo = new JSONObject();
-            subdirInfo.put("folder", "example1");
-            subdirInfo.put("enabled", false);
-            subdirs.put(subdirInfo);
-
-            subdirInfo = new JSONObject();
-            subdirInfo.put("folder", "example2");
-            subdirInfo.put("enabled", false);
-            subdirs.put(subdirInfo);
-
-            config.put("subdirectories", subdirs);
-
-            fw.write(config.toString(4));
-        } catch (Exception e) {
-            Toast.makeText(getApplicationContext(), "Couldn't generate default config file...", Toast.LENGTH_SHORT).show();
-        }
-
-    }
-
-    void loadConfigFile() {
-        File configFile = new File(imageFolder + configFilename);
-
-        if (configFile.exists()) {
-            StringBuilder text = new StringBuilder();
-
-            try {
-                BufferedReader br = new BufferedReader(new FileReader(configFile));
-                String line;
-
-                while ((line = br.readLine()) != null) {
-                    text.append(line);
-                    text.append('\n');
+    void loadImageList() { requestMediaScan(false); }
+    private void requestMediaScan(boolean force) {
+        if (isDestroyed() || !hasMediaPermission() || mediaScanner.isShutdown()) return;
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (!force && (scanning || lastScanAt > 0 && now - lastScanAt < 60000)) return;
+        if (scanJob != null) scanJob.cancel(true);
+        int serial = ++scanSerial; scanning = true; lastScanAt = now;
+        SharedPreferences prefs = FramePreferences.get(this);
+        boolean whole = "all".equals(prefs.getString("mediaSource", "all")), videos = prefs.getBoolean("includeVideos", true);
+        scanJob = mediaScanner.submit(() -> {
+            List<String> sources = MediaLibrary.scan(getApplicationContext(), whole, videos, imageFolder);
+            if (Thread.currentThread().isInterrupted()) return;
+            runOnUiThread(() -> {
+                if (isDestroyed() || serial != scanSerial) return;
+                scanning = false;
+                if (allPictures.equals(sources) && !picturesRemaining.isEmpty()) return;
+                String current = imageIndex >= 0 && imageIndex < picturesRemaining.size() ? picturesRemaining.get(imageIndex) : resumeSource;
+                allPictures = sources; unreadableMedia.retainAll(sources); refillRemainingPictures();
+                int found = current == null ? -1 : picturesRemaining.indexOf(current);
+                imageIndex = found >= 0 ? randomPageStarts.get(randomPageIndex(found)) : picturesRemaining.isEmpty() ? -1 : 0;
+                resumeSource = null; photosPerPage = countAt(imageIndex);
+                if (controls != null && !controls.blocked()) {
+                    if (imageIndex >= 0) showPictureAsync(picturesRemaining.get(imageIndex)); else showNoPicturesIcon();
+                    delayImageUpdate();
                 }
-                br.close();
-                //Toast.makeText(getApplicationContext(), "Loaded config file!", Toast.LENGTH_SHORT).show();
-
-                JSONObject configJson = new JSONObject(text.toString());
-
-                imageUpdateTime = configJson.getInt("imageTime");
-                //Toast.makeText(getApplicationContext(), "Image update time is now "+imageUpdateTime, Toast.LENGTH_SHORT).show();
-                shuffleImages = configJson.getBoolean("shuffle");
-
-                showFileNames = configJson.getBoolean("showFileNames");
-
-                activeHourStart = configJson.getInt("activeHourStart");
-                activeHourEnd = configJson.getInt("activeHourEnd");
-
-                ntpServer = configJson.getString("ntpServer");
-                forceClockSync = configJson.getBoolean("forceClockSync");
-                ntpUpdateTime = configJson.getInt("ntpSyncInterval");
-
-                JSONArray fileTypesJson = configJson.getJSONArray("fileTypes");
-                allowedFileExtensions = new ArrayList<>();
-                for (int i = 0; i < fileTypesJson.length(); i++) {
-                    allowedFileExtensions.add(fileTypesJson.getString(i));
-                }
-
-                JSONArray subdirsJson = configJson.getJSONArray("subdirectories");
-                subdirectories = new ArrayList<>();
-                for (int i = 0; i < subdirsJson.length(); i++) {
-                    JSONObject subdirInfo = subdirsJson.getJSONObject(i);
-                    boolean enabled = subdirInfo.getBoolean("enabled");
-                    String folder = subdirInfo.getString("folder");
-
-                    if (enabled) {
-                        subdirectories.add(folder);
-                    }
-
-                }
-
-                //Load file types into the real list
-
-
-            } catch (IOException e) {
-                Toast.makeText(getApplicationContext(), "Couldn't read config file...", Toast.LENGTH_SHORT).show();
-            } catch (JSONException e) {
-                Toast.makeText(getApplicationContext(), "Couldn't parse config file...", Toast.LENGTH_SHORT).show();
-            } catch (Exception e) {
-                Toast.makeText(getApplicationContext(), "Some other failure...", Toast.LENGTH_SHORT).show();
-            }
-
-        } else {
-            //Create new default config file
-            try {
-                if (configFile.createNewFile()) {
-                    FileWriter fw = new FileWriter(configFile);
-                    createDefaultConfig(fw);
-                    fw.close();
-                }
-            } catch (Exception e) {
-                Toast.makeText(getApplicationContext(), "Couldn't create config file...", Toast.LENGTH_SHORT).show();
-            }
-        }
-
+            });
+        });
     }
-
-    boolean isFileImage(String filename) {
-        if (filename.startsWith(".")) {
-            return false;
-        }
-
-        boolean fileTypeMatch = false;
-
-        for (int i = 0; i < allowedFileExtensions.size() && !fileTypeMatch; i++) {
-            if (filename.toLowerCase().endsWith(allowedFileExtensions.get(i))) {
-                fileTypeMatch = true;
-            }
-        }
-        return fileTypeMatch;
-    }
-
-    void loadImageList() {
-        File directory = new File(imageFolder);
-        File[] files = directory.listFiles();
-        if (files != null && files.length > 0) {
-            for (File file : files) {
-                String filename = file.getName();
-                if (isFileImage(filename)) {
-                    if (!allPictures.contains(imageFolder + filename)) {
-                        allPictures.add(imageFolder + filename);
-                    }
-                }
-            }
-        }
-
-        for (String folder : subdirectories) {
-            Log.i(TAG, "Loading images from " + folder);
-            directory = new File(imageFolder + folder);
-            files = directory.listFiles();
-            if (files != null && files.length > 0) {
-                for (File file : files) {
-                    String filename = file.getName();
-                    if (isFileImage(filename)) {
-                        if (!allPictures.contains(imageFolder + folder + "/" + filename)) {
-                            allPictures.add(imageFolder + folder + "/" + filename);
-                        }
-                    }
-                }
-            }
-
-        }
-
-        //Toast.makeText(getApplicationContext(), "Reloaded "+allPictures.size()+" images", Toast.LENGTH_SHORT).show();
-        Log.i(TAG, "Reloaded " + allPictures.size() + " images");
-    }
-
     void refillRemainingPictures() {
-        allPictures = new ArrayList<>();
-        loadImageList();
-        picturesRemaining = new ArrayList<>(allPictures);
-
-        //Shuffle if desired
-        if (shuffleImages) {
-            Collections.shuffle(picturesRemaining);
-        } else {
-            Collections.sort(picturesRemaining, String::compareToIgnoreCase);
-        }
+        picturesRemaining = new ArrayList<>(allPictures); picturesRemaining.removeAll(unreadableMedia);
+        if (shuffleImages) Collections.shuffle(picturesRemaining); else Collections.sort(picturesRemaining, String::compareToIgnoreCase);
+        randomPageStarts.clear(); randomPageCounts.clear(); ensureRandomPages();
     }
-
     void updateImage() {
-        loadConfigFile();
-        updateFlagsAndStuff();
-
-        if (active) {
-            imageIndex++;
-            if (imageIndex >= picturesRemaining.size()) {
-                refillRemainingPictures();
-                imageIndex = 0;
-            }
-
-            Log.i(TAG,"Image index is now "+imageIndex);
-
-            if (imageIndex < picturesRemaining.size()) {
-                String nextPic = picturesRemaining.get(imageIndex);
-                if (showFileNames) {
-                    Toast.makeText(getApplicationContext(), nextPic, Toast.LENGTH_LONG).show();
-                }
-                showPictureAsync(nextPic);
-
-            } else {
-                showNoPicturesIcon();
-                Toast.makeText(getApplicationContext(), "No Pictures Found!", Toast.LENGTH_SHORT).show();
-            }
+        if (controls != null && controls.blocked()) return;
+        loadConfigFile(); updateFlagsAndStuff();
+        imageIndex = imageIndex < 0 ? 0 : imageIndex + countAt(imageIndex);
+        if (imageIndex >= picturesRemaining.size()) { requestMediaScan(false); refillRemainingPictures(); imageIndex = 0; }
+        photosPerPage = countAt(imageIndex);
+        if (imageIndex < picturesRemaining.size()) showPictureAsync(picturesRemaining.get(imageIndex)); else showNoPicturesIcon();
+    }
+    void goToNextImage() { transitionDirection = 1; updateImage(); if (!pause) delayImageUpdate(); }
+    void goToPreviousImage() {
+        if (controls.blocked()) return;
+        if (picturesRemaining.isEmpty()) { goToNextImage(); return; }
+        transitionDirection = -1; imageIndex = adjacentPage(-1); photosPerPage = countAt(imageIndex);
+        showPictureAsync(picturesRemaining.get(imageIndex)); if (!pause) delayImageUpdate();
+    }
+    void ensureRandomPages() {
+        int size = picturesRemaining.size(), mode = randomPhotoCount ? 0 : configuredPhotoCount;
+        if (pagePlanMode == mode && !randomPageStarts.isEmpty()) {
+            int last = randomPageStarts.size() - 1;
+            if (randomPageStarts.get(last) + randomPageCounts.get(last) == size) return;
+        }
+        pagePlanMode = mode; randomPageStarts.clear(); randomPageCounts.clear();
+        java.util.Random random = new java.util.Random();
+        for (int start = 0; start < size;) {
+            int wanted = randomPhotoCount ? (random.nextInt(10) < 6 ? 1 : 2 + random.nextInt(3)) : configuredPhotoCount;
+            int count = 1;
+            if (!MediaLibrary.isVideo(picturesRemaining.get(start)))
+                while (count < wanted && start + count < size && !MediaLibrary.isVideo(picturesRemaining.get(start + count))) count++;
+            randomPageStarts.add(start); randomPageCounts.add(count); start += count;
         }
     }
-
-    void showNoPicturesIcon(){
-        image = findViewById(R.id.imageView);
-        image.setImageResource(R.drawable.no_images);
+    int randomPageIndex(int start) {
+        for (int i = randomPageStarts.size() - 1; i >= 0; i--) if (start >= randomPageStarts.get(i)) return i;
+        return 0;
     }
-
-    void showBrokenImageIcon(){
-        image = findViewById(R.id.imageView);
-        image.setImageResource(R.drawable.broken_image);
-
-        imageIndex=picturesRemaining.size(); //This will cause the app to reload the image list next update
-        updateImage(); //And look at that, we're updating!
-
+    int countAt(int start) { ensureRandomPages(); return randomPageCounts.isEmpty() ? 1 : randomPageCounts.get(randomPageIndex(start)); }
+    int adjacentPage(int offset) {
+        ensureRandomPages(); int pages = randomPageStarts.size(); if (pages == 0) return 0;
+        return randomPageStarts.get((randomPageIndex(imageIndex) + offset % pages + pages) % pages);
     }
-
-    void goToPreviousImage(){
-        if (imageIndex == 0){ //If it's showing the first picture...
-             //Currently showing first picture, can't go back
-            Toast.makeText(getApplicationContext(), "Cannot scroll further back!", Toast.LENGTH_SHORT).show();
-        } else {
-            if(!pause) { //Stay paused if already paused...
-                delayImageUpdate();
+    List<String> pagePaths(int start) {
+        List<String> paths = new ArrayList<>(); if (start < 0) return paths;
+        for (int i = 0; i < countAt(start) && start + i < picturesRemaining.size(); i++) paths.add(picturesRemaining.get(start + i));
+        return paths;
+    }
+    private void stopVideo() { showingVideo = false; video.stop(); video.setVisibility(View.GONE); image.setVisibility(View.VISIBLE); }
+    void showNoPicturesIcon() {
+        photoRequest++; stopVideo(); image.clearPhoto(); image.setImageResource(R.drawable.no_images);
+        if (controls != null) controls.setPhoto(scanning ? MainActivity.this.getString(R.string.text_searching_for_photos_and_videos) : MainActivity.this.getString(R.string.text_no_readable_media_found_grant_permission_or_rescan_the_library));
+    }
+    void showBrokenImageIcon() { stopVideo(); image.clearPhoto(); image.setImageResource(R.drawable.broken_image); }
+    private void failedPage(List<String> sources, int request) {
+        unreadableMedia.addAll(sources); showBrokenImageIcon();
+        controls.setPhoto(MainActivity.this.getString(R.string.text_unsupported_file_skipping));
+        updateImageHandler.removeCallbacks(updateImageRunnable);
+        if (!pause && !controls.blocked()) updateImageHandler.postDelayed(() -> {
+            if (photoRequest == request && !pause && !controls.blocked()) goToNextImage();
+        }, 1000);
+    }
+    private void showVideo(String source, int request) {
+        photoLoader.suspend(); showingVideo = true; image.clearPhoto(); image.setVisibility(View.INVISIBLE); video.setVisibility(View.VISIBLE);
+        updateImageHandler.removeCallbacks(updateImageRunnable); controls.setPhoto("Video");
+        video.show(source, !FramePreferences.get(this).getBoolean("videoSound", false), pause || !active || controls.blocked(), new FrameVideoView.Listener() {
+            @Override public void prepared(int width, int height, int duration) {
+                if (photoRequest == request && !isDestroyed()) controls.setPhoto(getString(R.string.video_info, width, height, duration / 1000));
             }
-            imageIndex-=2; //Have to skip back two, since it increments in updateImage
-            updateImage();
-        }
+            @Override public void completed() { if (photoRequest == request && !pause && !controls.blocked()) goToNextImage(); }
+            @Override public void failed() { if (photoRequest == request) failedPage(Collections.singletonList(source), request); }
+        });
+        if (videoResumePosition > 0) { video.seekTo(videoResumePosition); videoResumePosition = 0; }
     }
-
-    void goToNextImage(){
-        if (imageIndex == picturesRemaining.size()){ //If it's showing the last picture...
-            //Currently showing last picture, can't go forward
-            Toast.makeText(getApplicationContext(), "Cannot scroll further forward!", Toast.LENGTH_SHORT).show();
-        } else {
-            if (!pause) { //Stay paused if already paused...
-                delayImageUpdate();
+    void showPictureAsync(String source) {
+        int request = ++photoRequest; photosPerPage = countAt(imageIndex);
+        if (MediaLibrary.isVideo(source)) {
+            if (FramePreferences.get(this).getBoolean("includeVideos", true)) showVideo(source, request);
+            else failedPage(Collections.singletonList(source), request);
+            return;
+        }
+        stopVideo();
+        final int direction = transitionDirection; transitionDirection = 1;
+        final List<String> paths = pagePaths(imageIndex);
+        photoLoader.loadPage(paths, frameWidth, frameHeight, cropPhotos, blurPhotos, result -> {
+            if (photoRequest != request || isFinishing() || isDestroyed() || controls.blocked()) return;
+            if (result == null) { failedPage(paths, request); return; }
+            image.show(result, transitionEffect, transitionDuration, direction, cropPhotos, blurPhotos);
+            controls.setPhoto(result.info); delayImageUpdate();
+            int pages = randomPageStarts.size();
+            if (pages > 1) {
+                prefetchPage(adjacentPage(-1));
+                int ahead = Math.min(photoLoader.preloadPages(randomPhotoCount ? 4 : configuredPhotoCount, frameWidth, frameHeight), pages - 1);
+                for (int i = 1; i <= ahead; i++) prefetchPage(adjacentPage(i));
             }
-            updateImage(); //Will automatically progress to next image
-        }
-
+        });
     }
-
-    void rotateExifValue(String filename,boolean clockwise){
+    private void prefetchPage(int index) {
+        List<String> paths = pagePaths(index);
+        if (!paths.isEmpty() && !MediaLibrary.isVideo(paths.get(0))) photoLoader.prefetchPage(paths, frameWidth, frameHeight, cropPhotos, blurPhotos);
+    }
+    void rotatePicture(boolean clockwise) {
+        if (controls.blocked() || imageIndex < 0 || imageIndex >= picturesRemaining.size() || countAt(imageIndex) != 1) return;
+        String source = picturesRemaining.get(imageIndex);
+        if (MediaLibrary.isVideo(source) || source.startsWith("content:")) return;
         try {
-            ExifInterface ei = new ExifInterface(filename);
-
-            int orientation = ei.getAttributeInt(ExifInterface.TAG_ORIENTATION,
-                    ExifInterface.ORIENTATION_UNDEFINED);
-
-            if (clockwise) {
-                switch (orientation) {
-                    case ExifInterface.ORIENTATION_ROTATE_90:
-                        ei.setAttribute(ExifInterface.TAG_ORIENTATION, String.valueOf(ExifInterface.ORIENTATION_ROTATE_180));
-                        break;
-                    case ExifInterface.ORIENTATION_ROTATE_180:
-                        ei.setAttribute(ExifInterface.TAG_ORIENTATION, String.valueOf(ExifInterface.ORIENTATION_ROTATE_270));
-                        break;
-                    case ExifInterface.ORIENTATION_ROTATE_270:
-                        ei.setAttribute(ExifInterface.TAG_ORIENTATION, String.valueOf(ExifInterface.ORIENTATION_NORMAL));
-                        break;
-                    case ExifInterface.ORIENTATION_NORMAL:
-                    default:
-                        ei.setAttribute(ExifInterface.TAG_ORIENTATION, String.valueOf(ExifInterface.ORIENTATION_ROTATE_90));
-                        break;
-                }
-            } else {
-                switch (orientation) {
-                    case ExifInterface.ORIENTATION_ROTATE_90:
-                        ei.setAttribute(ExifInterface.TAG_ORIENTATION, String.valueOf(ExifInterface.ORIENTATION_NORMAL));
-                        break;
-                    case ExifInterface.ORIENTATION_ROTATE_180:
-                        ei.setAttribute(ExifInterface.TAG_ORIENTATION, String.valueOf(ExifInterface.ORIENTATION_ROTATE_90));
-                        break;
-                    case ExifInterface.ORIENTATION_ROTATE_270:
-                        ei.setAttribute(ExifInterface.TAG_ORIENTATION, String.valueOf(ExifInterface.ORIENTATION_ROTATE_180));
-                        break;
-                    case ExifInterface.ORIENTATION_NORMAL:
-                    default:
-                        ei.setAttribute(ExifInterface.TAG_ORIENTATION, String.valueOf(ExifInterface.ORIENTATION_ROTATE_270));
-                        break;
-                }
-            }
-            ei.saveAttributes();
-        } catch(Exception e){
-            e.printStackTrace();
-        }
-
+            ExifInterface exif = new ExifInterface(source); exif.rotate(clockwise ? 90 : -90); exif.saveAttributes();
+            photoLoader.clear(); showPictureAsync(source);
+        } catch (Exception e) { Log.w(TAG, "Photo rotation unavailable", e); }
     }
-
-    void rotatePicture(boolean clockwise){
-        if(!pause){
+    void refreshSchedule() { updateFlagsAndStuff(); }
+    void updateFlagsAndStuff() {
+        int hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY);
+        SharedPreferences prefs = FramePreferences.get(this);
+        int start = prefs.getInt("scheduleStart", activeHourStart), end = prefs.getInt("scheduleEnd", activeHourEnd);
+        boolean next = !prefs.getBoolean("useSchedule", false) || start == end || (start < end
+                ? hour >= start && hour < end : hour >= start || hour < end);
+        if (next || controls != null && controls.nightMode()) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        boolean changed = active != next;
+        if (next && !active && (controls == null || !controls.blocked())) turnScreenOn();
+        active = next;
+        if (changed && controls != null && !controls.blocked()) {
+            if (showingVideo) video.setPaused(pause || !active);
             delayImageUpdate();
         }
-
-        if(clockwise){
-            Toast.makeText(getApplicationContext(), "Rotating Clockwise", Toast.LENGTH_SHORT).show();
-        } else {
-            Toast.makeText(getApplicationContext(), "Rotating Counter-Clockwise", Toast.LENGTH_SHORT).show();
-        }
-        rotateExifValue(picturesRemaining.get(imageIndex),clockwise);
-        showPictureAsync(picturesRemaining.get(imageIndex));
-
+        getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+        if (getSupportActionBar() != null) getSupportActionBar().hide();
     }
-
     @SuppressWarnings("deprecation")
     @SuppressLint("WakelockTimeout")
-    void turnScreenOn(){
-        //SCREEN_BRIGHT_WAKE_LOCK is needed to actually turn the screen on
-        //(Maybe there's something better that isn't deprecated?)
-        @SuppressLint("InvalidWakeLockTag")
-        WakeLock screenLock = ((PowerManager) getSystemService(POWER_SERVICE)).newWakeLock(
-                PowerManager.SCREEN_BRIGHT_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP, "TAG");
-        screenLock.acquire();
-        Log.i(TAG, "Should have just made screen wake up");
-        screenLock.release();
-
+    private void turnScreenOn() {
+        PowerManager manager = (PowerManager) getSystemService(POWER_SERVICE);
+        PowerManager.WakeLock screen = manager.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP, TAG + ":screen");
+        screen.acquire(1000); screen.release();
     }
-
-    void updateFlagsAndStuff() {
-        Window window = getWindow();
-        Calendar cal = Calendar.getInstance();
-        Date curTime = cal.getTime();
-        @SuppressWarnings("deprecation") int curHour = curTime.getHours();
-
-        if (window != null) {
-            //Check if screen should still be on
-            if (curHour >= activeHourStart && curHour < activeHourEnd) {
-                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                Log.i(TAG, "Current hour is inside active hours - " + curHour);
-                if (!active) {
-                    //Toast.makeText(getApplicationContext(), "Active Hours have begun", Toast.LENGTH_SHORT).show();
-                    turnScreenOn();
-                }
-                active = true;
-            } else {
-                //To turn "keep screen on" off
-                Log.i(TAG, "Current hour is outside active hours - " + curHour);
-                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                active = false;
-            }
-            View decorView = window.getDecorView();
-            if (decorView != null) {
-                int uiOptions = 0;
-                if (hideUi) {
-                    uiOptions = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                            | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                            | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                            | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                            | View.SYSTEM_UI_FLAG_FULLSCREEN
-                            | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY;
-                }
-                decorView.setSystemUiVisibility(uiOptions);
-            }
-        }
-
-        if (getSupportActionBar() != null) {
-            getSupportActionBar().hide();
-        }
-
-    }
-
-    public static Bitmap rotateImage(Bitmap source, float angle) {
-        Matrix matrix = new Matrix();
-        matrix.postRotate(angle);
-        return Bitmap.createBitmap(source, 0, 0, source.getWidth(), source.getHeight(),
-                matrix, true);
-    }
-
-    public static Bitmap decodeFile(File f, int WIDTH, int HEIGHT) {
+    private void loadConfigFile() {
+        if (!hasMediaPermission()) return;
+        File file = new File(imageFolder, "config.json");
         try {
-            //Decode image size
-            BitmapFactory.Options o = new BitmapFactory.Options();
-            o.inJustDecodeBounds = true;
-            BitmapFactory.decodeStream(new FileInputStream(f), null, o);
-
-            //Find the correct scale value. It should be the power of 2.
-            int scale = 1;
-            while (o.outWidth / scale / 2 >= WIDTH && o.outHeight / scale / 2 >= HEIGHT)
-                scale *= 2;
-
-            Log.i(TAG, "Image scaling factor was " + scale);
-
-            //Decode with inSampleSize
-            BitmapFactory.Options o2 = new BitmapFactory.Options();
-            o2.inSampleSize = scale;
-            return BitmapFactory.decodeStream(new FileInputStream(f), null, o2);
-        } catch (FileNotFoundException e) {
-            e.printStackTrace();
-        }
-        return null;
+            if (!file.exists()) {
+                if (Build.VERSION.SDK_INT >= 29) return;
+                new File(imageFolder).mkdirs();
+                JSONObject initial = new JSONObject();
+                initial.put("imageTime", 60); initial.put("shuffle", true); initial.put("showFileNames", false);
+                initial.put("activeHourStart", 7); initial.put("activeHourEnd", 23);
+                initial.put("ntpServer", "pool.ntp.org"); initial.put("forceClockSync", false); initial.put("ntpSyncInterval", 3600);
+                initial.put("fileTypes", new JSONArray(new String[]{".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}));
+                initial.put("subdirectories", new JSONArray());
+                try (FileWriter writer = new FileWriter(file)) { writer.write(initial.toString(4)); }
+            }
+            if (file.lastModified() == configModified) return;
+            StringBuilder json = new StringBuilder();
+            try (BufferedReader reader = new BufferedReader(new FileReader(file))) { String line; while ((line = reader.readLine()) != null) json.append(line); }
+            JSONObject config = new JSONObject(json.toString());
+            SharedPreferences prefs = FramePreferences.get(this);
+            imageUpdateTime = Math.max(3, prefs.getInt("imageTime", config.optInt("imageTime", 60)));
+            shuffleImages = prefs.getBoolean("shuffle", config.optBoolean("shuffle", true));
+            activeHourStart = Math.max(0, Math.min(23, config.optInt("activeHourStart", 7)));
+            activeHourEnd = Math.max(0, Math.min(23, config.optInt("activeHourEnd", 23)));
+            ntpServer = config.optString("ntpServer", "pool.ntp.org"); forceClockSync = config.optBoolean("forceClockSync", false);
+            ntpUpdateTime = Math.max(60, config.optInt("ntpSyncInterval", 3600)); configModified = file.lastModified();
+        } catch (Exception e) { Log.w(TAG, "Legacy config is unavailable; using saved settings", e); }
     }
-
-    void showPictureAsync(String imageName) {
-        new ShowImageBackground().execute(imageName);
-    }
-
-    @SuppressLint({"NewApi", "SimpleDateFormat"})
-    private void setSystemClock(Date date){
-        SimpleDateFormat dateFormat;
-        //Android Studio claims this needs API Level 24, but nothing here requires more than API
-        //Level 1, as far as I can see???  Works just fine on my API Level 23 device...
-        dateFormat = new SimpleDateFormat("MMddHHmmyy.ss");
-
-        try {
-            Process process = Runtime.getRuntime().exec("su");
-            DataOutputStream os = new DataOutputStream(process.getOutputStream());
-
-            String command = "date " + dateFormat.format(date) + "\n";
-
-            os.writeBytes(command);
-            os.flush();
-            os.writeBytes("exit\n");
-            os.flush();
-            process.waitFor();
-            Log.i(TAG,"System time synced to NTP");
-        } catch (Exception e) {
-            Toast.makeText(getApplicationContext(), e.toString(), Toast.LENGTH_SHORT).show();
-            Log.e(TAG,e.toString());
-        }
-
-    }
-
-    @SuppressWarnings("deprecation")
     @SuppressLint("StaticFieldLeak")
-    private class ShowImageBackground extends AsyncTask<String,Integer,Bitmap> {
-        @Override
-        protected Bitmap doInBackground(String... params) {
-            try {
-                image = findViewById(R.id.imageView);
-               String imageName = params[0];
-                File imageFile = new File(imageName);
-
-                if (!imageFile.exists()) {
-                    Log.i(TAG, imageName + " does not exist?");
-                    return null;
-                }
-
-                ExifInterface ei = new ExifInterface(imageName);
-                //Bitmap bmImg = BitmapFactory.decodeFile(imageFolder + imageName);
-                Bitmap bmImg = decodeFile(imageFile, frameWidth, frameHeight);
-                if (bmImg == null) {
-                    Toast.makeText(getApplicationContext(), "Loaded null...", Toast.LENGTH_LONG).show();
-                    return null;
-                }
-
-                int orientation = ei.getAttributeInt(ExifInterface.TAG_ORIENTATION,
-                        ExifInterface.ORIENTATION_UNDEFINED);
-
-                switch (orientation) {
-
-                    case ExifInterface.ORIENTATION_ROTATE_90:
-                        bmImg = rotateImage(bmImg, 90);
-                        Log.i(TAG, imageName+" is Rotated 90...");
-                        break;
-
-                    case ExifInterface.ORIENTATION_ROTATE_180:
-                        bmImg = rotateImage(bmImg, 180);
-                        Log.i(TAG, imageName+" is Rotated 180...");
-                        break;
-
-                    case ExifInterface.ORIENTATION_ROTATE_270:
-                        bmImg = rotateImage(bmImg, 270);
-                        Log.i(TAG, imageName+" is Rotated 270...");
-                        break;
-
-                    case ExifInterface.ORIENTATION_NORMAL:
-                    default:
-                        Log.i(TAG, imageName+" is not Rotated...");
-                        break;
-                }
-
-                return bmImg;
-                //Toast.makeText(getApplicationContext(),imageName,Toast.LENGTH_LONG).show();
-            } catch (Exception e) {
-                Log.e(TAG, "Failed somehow!");
-                e.printStackTrace();
-
-                return null;
-            }
-        }
-
-        @Override
-        protected void onPostExecute(Bitmap result) {
-            //Image should be set still, but just to be safe
-            image = findViewById(R.id.imageView);
-            if (result!=null) {
-                image.setImageBitmap(result);
-            } else {
-                showBrokenImageIcon();
-            }
-            if (lastBitmap != null) {
-                lastBitmap.recycle();
-            }
-            lastBitmap = result;
-        }
-    }
-
-    @SuppressWarnings("deprecation")
-    @SuppressLint("StaticFieldLeak")
-    private class GetNTPTimeBackground extends AsyncTask<String,Integer,Date> {
-        @Override
-        protected Date doInBackground(String... params) {
+    private class ClockTask extends AsyncTask<Void, Void, Date> {
+        @Override protected Date doInBackground(Void... unused) {
             SntpClient client = new SntpClient();
-            long nowAsPerDeviceTimeZone;
-
-            if (ntpServer.equals("") || !forceClockSync){
-                return null;
-            }
-
-            if (client.requestTime(ntpServer,30000)){
-                nowAsPerDeviceTimeZone = client.getNtpTime();
-
-                Calendar cal = Calendar.getInstance();
-                TimeZone timeZoneInDevice = cal.getTimeZone();
-                int differentialOfTimeZones = timeZoneInDevice.getOffset(System.currentTimeMillis());
-                nowAsPerDeviceTimeZone += differentialOfTimeZones;
-                return new Date(nowAsPerDeviceTimeZone);
-            }
-
-            return null;
+            return client.requestTime(ntpServer, 30000) && !isCancelled() ? new Date(client.getNtpTime()) : null;
         }
-
-        @Override
-        protected void onPostExecute(Date result) {
-            if (result!=null) {
-                if (forceClockSync){
-                    setSystemClock(result);
-
+        @Override protected void onPostExecute(Date date) {
+            if (date == null || isCancelled() || isDestroyed() || controls.blocked() || !forceClockSync) return;
+            try {
+                Process process = Runtime.getRuntime().exec("su");
+                try (DataOutputStream stream = new DataOutputStream(process.getOutputStream())) {
+                    stream.writeBytes("date " + new SimpleDateFormat("MMddHHmmyy.ss", Locale.US).format(date) + "\nexit\n"); stream.flush();
                 }
-            } else {
-                if (!ntpServer.equals("") && forceClockSync) {
-                    Log.e(TAG, "Failed to get a time from NTP");
-                }
-            }
+            } catch (Exception e) { Log.w(TAG, "Root clock sync unavailable", e); }
         }
     }
 }

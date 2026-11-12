@@ -7,25 +7,36 @@
     android:background="#000000"
     tools:context="nuts.deez.photoframeslideshow.MainActivity">
 
-    <ImageView
+    <nuts.deez.photoframeslideshow.FrameVideoView
+        android:id="@+id/videoView"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:visibility="gone"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <nuts.deez.photoframeslideshow.PhotoFrameView
         android:id="@+id/imageView"
         android:layout_width="0dp"
         android:layout_height="0dp"
-        android:adjustViewBounds="false"
-        android:background="#000000"
         android:contentDescription="@string/mainslideshow"
-        android:cropToPadding="false"
         android:scaleType="fitCenter"
-        android:visibility="visible"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintHorizontal_bias="0.0"
         app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintTop_toTopOf="parent"
-        app:layout_constraintVertical_bias="0.0"
-        app:srcCompat="@color/black"
-        tools:srcCompat="@drawable/no_images"
-        tools:visibility="visible" />
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <View
+        android:id="@+id/gestureLayer"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:contentDescription="@string/mainslideshow"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
 
     <ImageView
         android:id="@+id/pauseIcon"
@@ -33,10 +44,73 @@
         android:layout_height="94dp"
         android:layout_marginStart="16dp"
         android:layout_marginBottom="16dp"
-        android:visibility="invisible"
+        android:visibility="gone"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:srcCompat="@drawable/pause_circle" />
+
+    <TextView
+        android:id="@+id/photoInfo"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_margin="24dp"
+        android:maxWidth="480dp"
+        android:padding="12dp"
+        android:background="#55000000"
+        android:textColor="#DDFFFFFF"
+        android:textSize="14sp"
+        android:shadowColor="#CC000000"
+        android:shadowRadius="4"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+    <TextView
+        android:id="@+id/frameClock"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginEnd="32dp"
+        android:layout_marginBottom="2dp"
+        android:textColor="#FFFFFF"
+        android:textSize="54sp"
+        android:fontFamily="sans-serif-light"
+        android:shadowColor="#CC000000"
+        android:shadowRadius="6"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintBottom_toTopOf="@id/frameDate" />
+    <TextView
+        android:id="@+id/frameDate"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginEnd="32dp"
+        android:layout_marginBottom="28dp"
+        android:textColor="#EEFFFFFF"
+        android:textSize="16sp"
+        android:shadowColor="#CC000000"
+        android:shadowRadius="6"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent" />
+    <ProgressBar
+        android:id="@+id/photoProgress"
+        style="?android:attr/progressBarStyleHorizontal"
+        android:layout_width="0dp"
+        android:layout_height="3dp"
+        android:max="1000"
+        android:progressTint="#CCFFFFFF"
+        android:progressBackgroundTint="#22FFFFFF"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent" />
+    <nuts.deez.photoframeslideshow.NightClockView
+        android:id="@+id/darkCurtain"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:background="#FF000000"
+        android:visibility="gone"
+        android:clickable="true"
+        android:focusable="true"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
 
 </androidx.constraintlayout.widget.ConstraintLayout>
 
